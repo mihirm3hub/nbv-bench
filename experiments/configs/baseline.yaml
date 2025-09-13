@@ -1,0 +1,45 @@
+mesh_path: assets/tsdf_mesh.ply
+
+intrinsics:
+  width: 640
+  height: 480
+  fov_deg: 80            # (optional) if you prefer fx/fy, add them and omit fov_deg
+
+hemisphere:
+  # auto scale hemisphere from mesh + intrinsics (recommended)
+  anchor: base
+  z_offset_m: 0.00
+  auto_radius: true
+  radius_factor: 6.0     # base distance = radius_factor * (max_extent/2)
+  fit_margin: 1.10       # ensures object fits in frustum given FOV
+  phi_deg_min: 0
+  phi_deg_max: 90
+  z_margin_m: 0.02       # lift hemisphere if needed
+  M: 256                 # number of candidate viewpoints
+
+tsdf:
+  voxel_m: 0.008
+  trunc_m: 0.024
+
+selectors:
+  greedy: {}
+  random: {}
+  sma:
+    pop: 32
+    gens: 10
+    elite: 2
+    topk: 3
+    alpha: 1.0
+    beta: 0.05
+    gamma: 0.2
+
+stopping:
+  max_views: 30
+  cov_target: 1.1
+
+seed: 0
+
+report:
+  out_dir: experiments/results/
+  tag: "baseline"
+  save_mesh: false
