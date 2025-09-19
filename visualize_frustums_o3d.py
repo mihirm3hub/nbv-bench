@@ -1,179 +1,287 @@
 #!/usr/bin/env python3
-# visualize_frustums_o3d.py
-import argparse, csv, json, os, math
-from typing import List
-import numpy as np
-import open3d as o3d
-import yaml
+"""
+NBV-Bench visualizer
+
+Default look (mode=aim + spheres):
+  • gray candidate spheres (size ∝ scene extent)
+  • larger green selected spheres
+  • green aim lines to origin
+  • white background
+
+Modes:
+  - aim      : aim lines + selected spheres (default)
+  - frusta   : camera frusta only (with selected spheres)
+  - both     : overlay frusta + aim lines
+
+Examples:
+python visualize_frustums_o3d.py \
+  --cfg experiments/configs/baseline.yaml \
+  --indices_csv experiments/results/baseline_greedy_selected.csv \
+  --mode both --cand_glyph spheres --recenter --axes --auto_fit \
+  --cand_radius_factor 0.015 --sel_radius_factor 0.03 --frustum_scale_factor 0.8
+"""
+import argparse, csv, os, json, numpy as np, yaml
+
+try:
+    import open3d as o3d
+except Exception as e:
+    raise RuntimeError("This visualizer requires Open3D. Try: pip install open3d") from e
 
 from nbvbench.data import load_scene_from_yaml, hemisphere_candidates_auto
 
-# -------- CSV (selected indices) --------
-def read_selection_indices_csv(path: str) -> List[int]:
-    with open(path, "r", newline="") as f:
-        try:
-            rdr = csv.DictReader(f)
-            if rdr.fieldnames is None:
-                f.seek(0); return [int(r[0]) for r in csv.reader(f) if r]
-            key = None
-            for k in ["view_index","index","view","v","candidate","id"]:
-                if k in rdr.fieldnames: key = k; break
-            if key is None and "step" in rdr.fieldnames:
-                others = [c for c in rdr.fieldnames if c!="step"]
-                if others: key = others[0]
-            if key is None: raise ValueError(f"No index column in headers {rdr.fieldnames}")
-            return [int(r[key]) for r in rdr if r.get(key,"").strip()]
-        except Exception:
-            f.seek(0); return [int(r[0]) for r in csv.reader(f) if r]
 
-# -------- Camera helpers (cam->world, forward=-Z) --------
-def look_at_extrinsic(eye: np.ndarray,
-                      center: np.ndarray,
-                      up=np.array([0,0,1.0], dtype=np.float32)) -> np.ndarray:
-    # Open3D expects world->camera extrinsic here.
-    f = center - eye
-    f = f / (np.linalg.norm(f) + 1e-12)
-    u = up / (np.linalg.norm(up) + 1e-12)
-    s = np.cross(f, u); s = s / (np.linalg.norm(s) + 1e-12)
-    u = np.cross(s, f)
-    R = np.stack([s, u, f], axis=0)     # rows
-    t = -R @ eye.reshape(3,1)
-    T_w2c = np.eye(4)
-    T_w2c[:3,:3] = R
-    T_w2c[:3, 3] = t[:,0]
-    return T_w2c
+# -------------------- helpers --------------------
+
+def read_selected_indices(csv_path: str) -> np.ndarray:
+    idx = []
+    with open(csv_path, "r", newline="") as f:
+        r = csv.reader(f)
+        _ = next(r, None)  # header
+        for row in r:
+            if len(row) >= 2:
+                idx.append(int(row[1]))
+    return np.array(idx, dtype=np.int32)
 
 
-def frustum_lineset(W, H, fx, fy, cx, cy, extrinsic, scale=0.1, color=(0,1,0)):
-    K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=np.float64)
-    ls = o3d.geometry.LineSet.create_camera_visualization(W, H, K, extrinsic, scale)
-    cols = np.tile(np.array(color, dtype=float)[None,:], (len(ls.lines),1))
-    ls.colors = o3d.utility.Vector3dVector(cols)
+def lookat_basis(c: np.ndarray, origin: np.ndarray):
+    fwd = origin - c
+    fwd = fwd / (np.linalg.norm(fwd) + 1e-9)
+    up_world = np.array([0, 0, 1], np.float32)
+    if abs(float(np.dot(fwd, up_world))) > 0.98:
+        up_world = np.array([1, 0, 0], np.float32)
+    right = np.cross(fwd, up_world); right /= (np.linalg.norm(right) + 1e-9)
+    up = np.cross(right, fwd)
+    Rwc = np.stack([right, up, fwd], axis=1)
+    return Rwc
+
+
+def make_frustum_lineset(c: np.ndarray, origin: np.ndarray, intr: tuple, scale: float, color=(0,0.6,0)):
+    """Wire frustum at camera center c looking at origin."""
+    fx, fy, W, H = intr
+    cx, cy = 0.5 * W, 0.5 * H
+    Rwc = lookat_basis(c, origin)
+    # image corners in cam frame (z=1)
+    us = np.array([0.0, W, W, 0.0], dtype=np.float32)
+    vs = np.array([0.0, 0.0, H, H], dtype=np.float32)
+    x = (us - cx) / fx; y = (vs - cy) / fy; z = np.ones_like(x)
+    D_cam = np.stack([x, y, z], axis=1)
+    D_cam = D_cam / (np.linalg.norm(D_cam, axis=1, keepdims=True) + 1e-9)
+    D_world = (Rwc @ D_cam.T).T
+    corners = c[None, :] + scale * D_world
+    pts = np.vstack([c[None, :], corners]).astype(np.float32)
+    lines = np.array([[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]], dtype=np.int32)
+    col = np.tile(np.asarray(color, dtype=np.float32), (len(lines), 1))
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(pts)
+    ls.lines  = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(col)
     return ls
 
 
-def color_by_step(i: int, total: int, base: np.ndarray):
-    a = 0.3 + 0.7*(i/max(1,total-1))
-    return tuple(a*base + (1-a)*np.array([0.7,0.7,0.7]))
+def make_aim_lines(centers: np.ndarray, origin: np.ndarray, sel_idx: np.ndarray, color=(0,0.6,0)):
+    """LineSet with lines from each selected camera to origin."""
+    if len(sel_idx) == 0:
+        return None
+    points = [origin]
+    lines, colors = [], []
+    for i, v in enumerate(sel_idx, start=1):
+        points.append(centers[v])
+        lines.append([0, i])
+        colors.append(color)
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float32))
+    ls.lines  = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+    ls.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float32))
+    return ls
 
-# -------- Intrinsics helper (if YAML uses fov_deg) --------
-def fx_fy_from_fov(W, H, fov_deg):
-    f = 0.5 * W / math.tan(math.radians(fov_deg)/2.0)
-    return f, f
 
-# -------- Main --------
+def mesh_aabb_lines(mesh, color=(1,0,0)):
+    aabb = mesh.get_axis_aligned_bounding_box()
+    aabb.color = np.asarray(color, dtype=np.float64)
+    return aabb
+
+
+def add_spheres(centers: np.ndarray, idx: np.ndarray, radius: float, color=(0.1,0.8,0.1), stride: int = 1, limit: int = 0):
+    """Add sphere glyphs at centers[idx]."""
+    out = []
+    if idx is None:
+        iterable = centers[::max(1, stride)]
+    else:
+        iterable = centers[idx][::max(1, stride)]
+    count = 0
+    for c in iterable:
+        sph = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        sph.compute_vertex_normals()
+        sph.paint_uniform_color(color)
+        sph.translate(c)
+        out.append(sph)
+        count += 1
+        if limit > 0 and count >= limit:
+            break
+    return out
+
+
+def combined_aabb(geoms):
+    mins, maxs = [], []
+    for g in geoms:
+        if hasattr(g, "get_axis_aligned_bounding_box"):
+            bb = g.get_axis_aligned_bounding_box()
+            mins.append(np.asarray(bb.get_min_bound()))
+            maxs.append(np.asarray(bb.get_max_bound()))
+    if not mins: return None
+    mins = np.vstack(mins).min(axis=0); maxs = np.vstack(maxs).max(axis=0)
+    return o3d.geometry.AxisAlignedBoundingBox(min_bound=mins, max_bound=maxs)
+
+
+# -------------------- main --------------------
+
 def main():
-    ap = argparse.ArgumentParser(description="NBV frustum visualizer (loads saved candidates if present)")
-    ap.add_argument("--cfg", type=str, default="experiments/configs/baseline.yaml")
-    ap.add_argument("--indices_csv", type=str, required=True)
+    ap = argparse.ArgumentParser("NBV-Bench Visualizer")
+    ap.add_argument("--cfg", required=True)
+    ap.add_argument("--indices_csv", required=True)
+    # Optional saved candidates/meta (not required)
+    ap.add_argument("--candidates_npy", default="")
+    ap.add_argument("--meta_json", default="")
+    # Modes
+    ap.add_argument("--mode", choices=["aim","frusta","both"], default="aim")
+    # Candidate glyphs
+    ap.add_argument("--cand_glyph", choices=["spheres","points"], default="spheres")
+    ap.add_argument("--cand_stride", type=int, default=1, help="Draw every N-th candidate (for performance)")
+    ap.add_argument("--cand_limit", type=int, default=0, help="Max candidate glyphs (0 = no cap)")
+    # Toggles
+    ap.add_argument("--show_candidates", type=str, default="true")  # true/false
+    ap.add_argument("--show_bbox", action="store_true")
+    ap.add_argument("--axes", action="store_true")
     ap.add_argument("--recenter", action="store_true")
-    ap.add_argument("--show_candidates", type=lambda s: s.lower()!="false", default=True)
+    # Scale & sizes
+    ap.add_argument("--unit_scale", type=float, default=1.0, help="e.g., 0.001 for mm→m")
+    ap.add_argument("--cand_point_size", type=float, default=2.5)  # only used if cand_glyph=points
+    ap.add_argument("--cand_radius_factor", type=float, default=0.010, help="candidate sphere radius = factor * scene_extent")
+    ap.add_argument("--cand_radius_abs", type=float, default=0.0, help="absolute candidate sphere radius (overrides factor)")
+    ap.add_argument("--sel_radius_factor", type=float, default=0.025, help="selected sphere radius = factor * scene_extent")
+    ap.add_argument("--frustum_scale_factor", type=float, default=0.6)
+    ap.add_argument("--frustum_scale_abs", type=float, default=0.0)
+    ap.add_argument("--frustum_color", type=str, default="0,0.6,0", help="r,g,b in [0,1] for frusta")
+    # Selection sampling
+    ap.add_argument("--stride", type=int, default=1, help="Subsample selected indices")
     ap.add_argument("--limit_frustums", type=int, default=0)
-    ap.add_argument("--stride", type=int, default=1)
-    ap.add_argument("--frustum_scale_factor", type=float, default=0.30)
-    ap.add_argument("--base_color", type=float, nargs=3, default=[0.1,0.7,0.2])
+    # Viewer behavior
+    ap.add_argument("--auto_fit", action="store_true")
+    ap.add_argument("--line_width", type=float, default=1.8)
     args = ap.parse_args()
 
-    with open(args.cfg, "r") as f:
-        cfg = yaml.safe_load(f)
+    show_candidates = str(args.show_candidates).lower() not in ["false","0","no"]
+    fr_col = tuple(float(v) for v in args.frustum_color.split(",")) if args.frustum_color else (0,0.6,0)
 
-    # Intrinsics (support fov_deg or fx/fy)
-    W = int(cfg["intrinsics"]["width"]); H = int(cfg["intrinsics"]["height"])
-    intr = cfg["intrinsics"]
-    if "fx" in intr and "fy" in intr: fx, fy = float(intr["fx"]), float(intr["fy"])
-    else: fx, fy = fx_fy_from_fov(W, H, float(intr["fov_deg"]))
-    cx, cy = W/2.0, H/2.0
-
-    # Scene
+    # Load cfg & scene
+    cfg = yaml.safe_load(open(args.cfg, "r"))
     scene = load_scene_from_yaml(cfg)
-    hemi = cfg["hemisphere"]
-    anchor = str(hemi.get("anchor", "center")).lower()
-    z_off = float(hemi.get("z_offset_m", 0.0))
-    z_margin = float(hemi.get("z_margin_m", 0.0))  # still supported
+    if scene.mesh is None:
+        raise RuntimeError("Could not load mesh from config.")
 
-    if anchor == "base" and scene.mesh is not None:
-        aabb = scene.mesh.get_axis_aligned_bounding_box()
-        z_min = float(aabb.get_min_bound()[2])
-        obj_center = np.array([scene.center[0], scene.center[1], z_min + z_off], dtype=np.float32)
+    # Get candidates, intrinsics, origin (5-return API)
+    centers = None; intr = None; origin = None
+    if args.candidates_npy and os.path.exists(args.candidates_npy):
+        centers = np.load(args.candidates_npy).astype(np.float32)
+        if args.meta_json and os.path.exists(args.meta_json):
+            meta = json.load(open(args.meta_json, "r"))
+            intr = (float(meta["intrinsics"]["fx"]), float(meta["intrinsics"]["fy"]),
+                    int(meta["intrinsics"]["W"]), int(meta["intrinsics"]["H"]))
+            origin = np.array(meta.get("origin", scene.center.tolist()), dtype=np.float32)
+        else:
+            _, _, _, intr, origin = hemisphere_candidates_auto(cfg, scene)
     else:
-        obj_center = scene.center + np.array([0,0,z_margin], dtype=np.float32)
+        centers, _, _, intr, origin = hemisphere_candidates_auto(cfg, scene)
 
+    fx, fy, W, H = intr
 
-    # Prefer saved candidates from the run (exact match)
-    tag = cfg.get("report", {}).get("tag", "run")
-    out_dir = cfg["report"]["out_dir"]
-    cand_npy  = os.path.join(out_dir, f"{tag}_candidates.npy")
-    meta_json = os.path.join(out_dir, f"{tag}_candidates_meta.json")
+    # Selected indices
+    sel = read_selected_indices(args.indices_csv)
+    if args.stride > 1: sel = sel[::max(1,int(args.stride))]
+    if args.limit_frustums > 0 and len(sel) > args.limit_frustums: sel = sel[:args.limit_frustums]
 
-    if os.path.exists(cand_npy):
-        centers = np.load(cand_npy)  # (M,3)
-        # Re-derive mean radius and dirs for orientation
-        radius = np.mean(np.linalg.norm(centers - obj_center, axis=1))
-        dirs = centers - obj_center
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-9
-        meta = {}
-        if os.path.exists(meta_json):
-            with open(meta_json, "r") as f: meta = json.load(f)
-            # Soft checks: warn if YAML and meta disagree
-            warn = []
-            if int(meta.get("M", len(centers))) != len(centers): warn.append("M")
-            if abs(meta.get("radius", radius) - radius) > 1e-5: warn.append("radius")
-            if meta.get("intrinsics", {}).get("W") != W or meta.get("intrinsics", {}).get("H") != H: warn.append("W/H")
-            if warn: print(f"[viz] WARNING: meta mismatch on {warn}; using saved candidates anyway.")
-        print(f"[viz] Loaded saved candidates: {cand_npy}")
-    else:
-        # Fall back to recomputing (should still match if cfg hasn't changed)
-        centers, dirs, radius, _ = hemisphere_candidates_auto(cfg, scene)
-        print("[viz] No saved candidates found; recomputed from YAML.")
+    # Scale / recenter
+    s = float(args.unit_scale)
+    scene_extent = max(scene.max_extent * s, 1e-6)
+    origin_vis = origin * s
+    shift = -origin_vis if args.recenter else np.zeros(3, dtype=np.float32)
 
-    # Optional recenter for drawing only
-    shift = -scene.center if args.recenter else np.zeros(3, dtype=np.float32)
-    obj_center_vis = obj_center + shift
-    scale_factor = 1.5   # 1.5x bigger hemisphere
-    centers_vis = (centers - obj_center) * scale_factor + obj_center + shift
+    # Mesh (light gray)
+    mesh = scene.mesh
+    if s != 1.0: mesh = mesh.scale(s, center=origin)  # keep origin fixed
+    if args.recenter: mesh = mesh.translate(shift)
+    mesh.compute_vertex_normals()
+    mesh.paint_uniform_color([0.85, 0.85, 0.85])
 
+    geoms = [mesh]
 
-    # Selections (declutter)
-    sel = read_selection_indices_csv(args.indices_csv)
-    if args.stride > 1: sel = sel[::args.stride]
-    if args.limit_frustums > 0: sel = sel[:args.limit_frustums]
-    print(f"[viz] frustums to draw: {len(sel)}")
+    # BBox
+    if args.show_bbox:
+        geoms.append(mesh_aabb_lines(mesh, color=(1,0,0)))
 
-    # Build scene geoms
-    geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)]
-    if scene.mesh is not None:
-        mesh = scene.mesh
-        if args.recenter: mesh = mesh.translate(shift)
-        mesh.compute_vertex_normals(); mesh.paint_uniform_color([0.82,0.82,0.82])
-        geoms.append(mesh)
+    # --- Candidates (GRAY) ---
+    if show_candidates and centers is not None:
+        centers_vis = (centers * s) + shift
+        if args.cand_glyph == "spheres":
+            cand_r = args.cand_radius_abs if args.cand_radius_abs > 0.0 else max(args.cand_radius_factor * scene_extent, 1e-5)
+            geoms += add_spheres(centers_vis, idx=None, radius=cand_r, color=(0.70, 0.70, 0.70),
+                                 stride=max(1, int(args.cand_stride)), limit=int(args.cand_limit))
+        else:
+            pts = o3d.geometry.PointCloud()
+            pts.points = o3d.utility.Vector3dVector(centers_vis)
+            pts.paint_uniform_color([0.70, 0.70, 0.70])  # gray
+            geoms.append(pts)
 
-    if args.show_candidates:
-        pc = o3d.geometry.PointCloud(points=o3d.utility.Vector3dVector(centers_vis.astype(np.float64)))
-        pc.paint_uniform_color([0.75,0.75,0.75]); geoms.append(pc)
+    # --- Selected spheres (GREEN) ---
+    centers_vis = (centers * s) + shift
+    sel_r = max(args.sel_radius_factor * scene_extent, 1e-4)
+    geoms += add_spheres(centers_vis, idx=sel, radius=sel_r, color=(0.1, 0.8, 0.1))
 
-    # Frustums
-    frustum_scale = max(args.frustum_scale_factor * max(scene.max_extent, 1e-6), 0.005)
-    base = np.array(args.base_color, dtype=float)
+    # --- AIM lines / Frusta / Both ---
+    want_aim = (args.mode in ("aim","both"))
+    want_frusta = (args.mode in ("frusta","both"))
 
-    for i, idx in enumerate(sel):
-        eye = centers_vis[idx]
-        extr = look_at_extrinsic(eye, obj_center_vis)
-        col = color_by_step(i, len(sel), base)
-        geoms.append(frustum_lineset(int(W), int(H), float(fx), float(fy), float(cx), float(cy),
-                                     extrinsic=extr, scale=frustum_scale, color=tuple(col)))
+    if want_aim:
+        ls = make_aim_lines(centers_vis, origin_vis + shift, sel, color=(0, 0.6, 0))
+        if ls is not None: geoms.append(ls)
 
-    print(f"[viz] mesh={scene.name} center={obj_center_vis} max_extent={scene.max_extent:.4f} "
-          f"radius≈{radius:.4f} frustum_scale={frustum_scale:.4f}")
+    if want_frusta and len(sel) > 0:
+        fr_len = float(args.frustum_scale_abs) if args.frustum_scale_abs > 0.0 else max(args.frustum_scale_factor * scene_extent, 1e-3)
+        frusta = []
+        for v in sel:
+            c = centers[v] * s + shift
+            frusta.append(make_frustum_lineset(c, origin_vis + shift, (fx, fy, W, H), fr_len, color=fr_col))
+        fused = frusta[0]
+        for f in frusta[1:]: fused += f
+        geoms.append(fused)
 
+    # Axes
+    if args.axes:
+        geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1 * scene_extent, origin=origin_vis + shift))
+
+    # ----- Show (WHITE BACKGROUND) -----
     vis = o3d.visualization.Visualizer()
-    vis.create_window()
+    vis.create_window("NBV-Bench Visualizer")
     for g in geoms: vis.add_geometry(g)
-    ctr = vis.get_view_control()
-    ctr.set_lookat(obj_center_vis.astype(float).tolist())
-    ctr.set_front([0.5, -0.5, 0.5])
-    ctr.set_up([0, 0, 1])
-    ctr.set_zoom(1.0)
-    vis.run(); vis.destroy_window()
+
+    opt = vis.get_render_option()
+    if hasattr(opt, "background_color"):
+        opt.background_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)  # white background
+    if hasattr(opt, "line_width"): opt.line_width = float(args.line_width)
+    if hasattr(opt, "point_size"): opt.point_size = float(args.cand_point_size)  # used if cand_glyph=points
+
+    # Auto-fit (simple)
+    bbox = combined_aabb(geoms)
+    if args.auto_fit and bbox is not None:
+        ctr = vis.get_view_control()
+        ctr.set_lookat(bbox.get_center())
+        ctr.set_up([0, 0, 1])
+        ctr.set_front([0, -1, -0.3])
+        ctr.set_zoom(0.7)
+
+    vis.run()
+    vis.destroy_window()
+
 
 if __name__ == "__main__":
     main()

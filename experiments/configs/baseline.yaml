@@ -1,45 +1,36 @@
-mesh_path: assets/tsdf_mesh.ply
+# experiments/configs/baseline.yaml
+seed: 0
+
+scene:
+  mesh: assets/tsdf_mesh.ply
 
 intrinsics:
   width: 640
   height: 480
-  fov_deg: 80            # (optional) if you prefer fx/fy, add them and omit fov_deg
+  fov_deg: 70
 
 hemisphere:
-  # auto scale hemisphere from mesh + intrinsics (recommended)
-  anchor: base
-  z_offset_m: 0.00
+  M: 512
+  phi_deg_min: 10
+  phi_deg_max: 85
   auto_radius: true
-  radius_factor: 6.0     # base distance = radius_factor * (max_extent/2)
-  fit_margin: 1.10       # ensures object fits in frustum given FOV
-  phi_deg_min: 0
-  phi_deg_max: 90
-  z_margin_m: 0.02       # lift hemisphere if needed
-  M: 256                 # number of candidate viewpoints
-
-tsdf:
-  voxel_m: 0.008
-  trunc_m: 0.024
-
-selectors:
-  greedy: {}
-  random: {}
-  sma:
-    pop: 32
-    gens: 10
-    elite: 2
-    topk: 3
-    alpha: 1.0
-    beta: 0.05
-    gamma: 0.2
+  radius_factor: 6.0
+  fit_margin: 1.10
+  anchor: base
+  z_offset_m: 0.02    # also accepts z_margin_m
 
 stopping:
   max_views: 30
-  cov_target: 1.1
+  cov_target: 1.0     # run to K for fair AUC across methods
 
-seed: 0
+coverage:
+  type: ray
+  n_samples: 200000    # reduce Monte Carlo noise
+  eps: 0.001           # stricter hit tolerance
+  near_m: 0.10
+  far_m: 1.3
+  require_front_facing: true
 
 report:
-  out_dir: experiments/results/
-  tag: "baseline"
-  save_mesh: false
+  out_dir: experiments/results
+  tag: baseline
